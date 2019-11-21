@@ -1,0 +1,157 @@
+# version 2  - with added comments --->>> hi
+
+import os
+import boto3
+import re
+import copy
+import time
+from time import gmtime, strftime
+from sagemaker import get_execution_role
+
+role = get_execution_role()
+
+region = boto3.Session().region_name
+
+bucket='bucket-name' # Replace with your s3 bucket name
+prefix = 'sagemaker/xgboost-mnist' # Used as part of the path in the bucket where you store data
+bucket_path = 'https://s3-{}.amazonaws.com/{}'.format(region,bucket) # The URL to access the bucket
+#****************
+
+%%time 
+import pickle, gzip, urllib.request, json
+import numpy as np
+
+# Load the dataset
+urllib.request.urlretrieve("http://deeplearning.net/data/mnist/mnist.pkl.gz", "mnist.pkl.gz")
+with gzip.open('mnist.pkl.gz', 'rb') as f:
+    train_set, valid_set, test_set = pickle.load(f, encoding='latin1')
+print(train_set[0].shape)
+
+%matplotlib inline
+import matplotlib.pyplot as plt
+
+plt.rcParams["figure.figsize"] = (2,10)
+
+for i in range(0, 10):
+    img = train_set[0][i]
+    label = train_set[1][i]
+    img_reshape = img.reshape((28,28))
+    imgplot = plt.imshow(img_reshape, cmap='gray')
+    print('This is a {}'.format(label))
+    plt.show()
+
+#********
+%%time
+
+import struct
+import io
+import csv
+import boto3
+        
+def convert_data():
+    data_partitions = [('train', train_set), ('validation', valid_set), ('test', test_set)]
+    for data_partition_name, data_partition in data_partitions:
+        print('{}: {} {}'.format(data_partition_name, data_partition[0].shape, data_partition[1].shape))
+        labels = [t.tolist() for t in data_partition[1]]
+        features = [t.tolist() for t in data_partition[0]]
+        
+        if data_partition_name != 'test':
+            examples = np.insert(features, 0, labels, axis=1)
+        else:
+            examples = features
+        #print(examples[50000,:])
+        
+        
+        np.savetxt('data.csv', examples, delimiter=',')
+        
+        
+        
+        key = "{}/{}/examples".format(prefix,data_partition_name)
+        url = 's3://{}/{}'.format(bucket, key)
+        boto3.Session().resource('s3').Bucket(bucket).Object(key).upload_file('data.csv')
+        print('Done writing to {}'.format(url))
+        
+convert_data()
+
+#*********
+
+import sagemaker
+
+from sagemaker.amazon.amazon_estimator import get_image_uri
+
+container = get_image_uri(boto3.Session().region_name, 'xgboost')
+
+#*******
+
+train_data = 's3://{}/{}/{}'.format(bucket, prefix, 'train')
+
+validation_data = 's3://{}/{}/{}'.format(bucket, prefix, 'validation')
+
+s3_output_location = 's3://{}/{}/{}'.format(bucket, prefix, 'xgboost_model_sdk')
+print(train_data)
+
+
+#**********
+
+xgb_model = sagemaker.estimator.Estimator(container,
+                                         role, 
+                                         train_instance_count=1, 
+                                         train_instance_type='ml.m4.xlarge',
+                                         train_volume_size = 5,
+                                         output_path=s3_output_location,
+                                         sagemaker_session=sagemaker.Session())
+
+#*****************
+
+xgb_model.set_hyperparameters(max_depth = 5,
+                              eta = .2,
+                              gamma = 4,
+                              min_child_weight = 6,
+                              silent = 0,
+                              objective = "multi:softmax",
+                              num_class = 10,
+                              num_round = 10)
+
+#*****************************
+train_channel = sagemaker.session.s3_input(train_data, content_type='text/csv')
+valid_channel = sagemaker.session.s3_input(validation_data, content_type='text/csv')
+
+data_channels = {'train': train_channel, 'validation': valid_channel}
+
+#***********
+xgb_model.fit(inputs=data_channels,  logs=True)
+
+#Deploy******
+
+xgb_predictor = xgb_model.deploy(initial_instance_count=1,
+                                instance_type='ml.m4.xlarge',
+                                )
+
+**********************************
+
+
+s3 = boto3.resource('s3')
+
+test_key = "{}/test/examples".format(prefix)
+
+s3.Bucket(bucket).download_file(test_key, 'test_data')
+
+%matplotlib inline
+                        
+for i in range (0, 10):
+    img = test_set[0][i]
+    label = test_set[1][i]
+    img_reshape = img.reshape((28,28))
+    imgplot = plt.imshow(img_reshape, cmap='gray')
+    print('This is a {}'.format(label))
+    plt.show()
+
+#**************** get inference of test datsa set.
+
+with open('test_data', 'r') as f:
+    for j in range(0,10):
+        single_test = f.readline()
+        result = xgb_predictor.predict(single_test)
+        print(result)
+
+**********************************
